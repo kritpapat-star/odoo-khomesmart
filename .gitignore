@@ -1,0 +1,27 @@
+# Environment files (contains sensitive credentials)
+.env
+
+# Log files
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+
+# Virtual environment
+venv/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
