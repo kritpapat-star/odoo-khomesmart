@@ -398,6 +398,7 @@ if __name__ == "__main__":
             # รัน auto check-in สำหรับวันปัจจุบัน
             auto_checkin_employees()
         elif sys.argv[1] == '--auto-checkin-date':
+
             # ระบุวันที่เอง เช่น --auto-checkin-date 2026-01-13
             if len(sys.argv) > 2:
                 try:
@@ -431,3 +432,4 @@ if __name__ == "__main__":
     else:
         # รันแบบปกติ: ซิงค์จากเครื่องสแกน
         sync_attendance()
+        

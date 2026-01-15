@@ -239,11 +239,11 @@ except xmlrpc.client.Fault as f:
 
 ### 1. Auto Check-In (10:00 น.)
 - **ปัญหา:** พนักงานลืมสแกนเข้างานตอนเช้า
-- **การทำงาน:** ระบบตรวจสอบพนักงานที่มี Barcode แต่ยังไม่มี Attendance ในวันนั้น และสร้าง Check-In เวลา **10:00:00** ให้อัตโนมัติ
+- **การทำงาน:** ระบบตรวจสอบพนักงานที่มี Barcode แต่ยังไม่มี Attendance ในวันนั้น และสร้าง Check-In เวลา **10:00:00** ให้อัตโนมัติ (โดยปรับเป็น UTC ด้วยการลบ 7 ชั่วโมง)
 
 ### 2. Auto Check-Out (เที่ยงคืน)
 - **ปัญหา:** พนักงานลืมสแกนออกงานตอนเย็น ทำให้วันถัดไปสแกนเข้าไม่ได้
-- **การทำงาน:** ระบบตรวจสอบ Attendance ที่ยังเปิดค้างอยู่ (ไม่มี Check-Out) ของวันก่อนหน้า และปิดงานด้วยเวลา **23:59:59** ให้อัตโนมัติ
+- **การทำงาน:** ระบบตรวจสอบ Attendance ที่ยังเปิดค้างอยู่ (ไม่มี Check-Out) ของวันก่อนหน้า และปิดงานด้วยเวลา **23:59:00** ให้อัตโนมัติ
 
 ### 3. Fully Automated (ไม่ต้องรันเอง)
 - ระบบทำงานผ่าน **Windows Task Scheduler**
@@ -296,7 +296,9 @@ AUTO_CHECKOUT_MINUTE=59
 |--------|------------|
 | `python app_secure.py` | ซิงค์ข้อมูลจากเครื่องสแกน (ปกติ) |
 | `python app_secure.py --auto-checkout` | รัน Auto Check-Out (สำหรับเมื่อวาน) |
+| `python app_secure.py --auto-checkout-date YYYY-MM-DD` | รัน Auto Check-Out สำหรับวันที่ระบุ |
 | `python app_secure.py --auto-checkin` | รัน Auto Check-In (สำหรับวันนี้) |
+| `python app_secure.py --auto-checkin-date YYYY-MM-DD` | รัน Auto Check-In สำหรับวันที่ระบุ |
 | `python app_secure.py --help` | ดูวิธีใช้งานทั้งหมด |
 
 ---
