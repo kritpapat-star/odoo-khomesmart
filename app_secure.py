@@ -65,85 +65,245 @@ def sync_attendance():
         print("Connected to ZKTeco...")
         attendances = conn.get_attendance()
         
+        # DEBUG: Log first attendance record details
+        if attendances:
+            first_att = attendances[0]
+            print(f"\n[DEBUG] First attendance record:")
+            print(f"  - user_id: {first_att.user_id}")
+            print(f"  - timestamp (raw): {first_att.timestamp}")
+            print(f"  - timestamp (type): {type(first_att.timestamp)}")
+            print(f"  - status attribute exists: {hasattr(first_att, 'status')}")
+            if hasattr(first_att, 'status'):
+                print(f"  - status value: {first_att.status}")
+            print(f"  - All attributes: {dir(first_att)}")
+        
         # เชื่อมต่อ Odoo
         uid, models = connect_to_odoo()
         print(f"Connected to Odoo (UID: {uid})...")
 
+        # จัดกลุ่มข้อมูล attendance ตามพนักงานและวันที่
+        # Key: (user_id, date_str), Value: {'checkins': [times], 'checkouts': [times]}
+        attendance_by_employee_date = {}
+        
         for att in attendances:
             # att.user_id คือรหัสพนักงานจากเครื่องสแกน
             # att.timestamp คือเวลาที่สแกน
+            # att.status คือประเภทการสแกน (0 = Check-In, 1 = Check-Out, อื่นๆ = อื่นๆ)
             
             # ค้นหา ID ของพนักงานใน Odoo ที่มี Badge ID ตรงกับเครื่องสแกน
             employee_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASS, 'hr.employee', 'search', 
                 [[['barcode', '=', str(att.user_id)]]]) # หรือเปลี่ยน 'barcode' เป็น 'pin' ตามที่ตั้งไว้
 
-            if employee_ids:
-                emp_id = employee_ids[0]
-                # ปรับเวลาโดยลบ 7 ชั่วโมง (timezone / offset correction)
-                adjusted_ts = att.timestamp - timedelta(hours=7)
-                check_time = adjusted_ts.strftime('%Y-%m-%d %H:%M:%S')
+            if not employee_ids:
+                print(f"Warning: Employee ID {att.user_id} not found in Odoo")
+                continue
+            
+            emp_id = employee_ids[0]
+            
+            # ปรับเวลาโดยลบ 7 ชั่วโมง (timezone / offset correction)
+            adjusted_ts = att.timestamp - timedelta(hours=7)
+            check_time = adjusted_ts.strftime('%Y-%m-%d %H:%M:%S')
+            date_str = adjusted_ts.strftime('%Y-%m-%d')
+            
+            # อ่าน status จากเครื่องสแกน (ถ้ามี)
+            # status 0 = Check-In, 1 = Check-Out, อื่นๆ = อื่นๆ
+            scan_status = getattr(att, 'status', None)
+            
+            # สร้าง key สำหรับจัดกลุ่ม
+            key = (emp_id, date_str)
+            
+            if key not in attendance_by_employee_date:
+                attendance_by_employee_date[key] = {'checkins': [], 'checkouts': []}
+            
+            # จัดเก็บข้อมูลตามประเภทการสแกน
+            if scan_status == 0:  # Check-In
+                attendance_by_employee_date[key]['checkins'].append(check_time)
+            elif scan_status == 1:  # Check-Out
+                attendance_by_employee_date[key]['checkouts'].append(check_time)
+            else:
+                # ถ้าไม่มี status หรือ status ไม่ชัดเจน ให้ใช้ลอจิกเดิม
+                # แสดง warning เมื่อ status attribute ไม่มี
+                if scan_status is None:
+                    print(f"Warning: Employee {att.user_id} scan at {check_time} has no status attribute, using fallback logic")
+                
                 # ตรวจสอบว่ามี attendance ที่เปิดอยู่ (ไม่มี check_out) สำหรับพนักงานนี้
-                open_att_ids = exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'search', args=[[['employee_id', '=', emp_id], ['check_out', '=', False]]])
-
+                open_att_ids = exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'search', 
+                    args=[[['employee_id', '=', emp_id], ['check_out', '=', False]]])
+                
                 if open_att_ids:
-                    # อ่าน check_in ของเรคอร์ดที่เปิดอยู่เพื่อเปรียบเทียบเวลา (ถ้าต้องการ)
-                    open_ats = exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'read', args=[open_att_ids, ['check_in']])
-                    for oid, rec in zip(open_att_ids, open_ats):
-                        check_in_str = rec.get('check_in')
+                    # ตั้งค่า check_out สำหรับ attendance ที่เปิดอยู่
+                    for oid in open_att_ids:
                         try:
-                            # แปลง check_in เป็น datetime เพื่อความแม่นยำ
-                            if check_in_str:
-                                check_in_dt = datetime.strptime(check_in_str, '%Y-%m-%d %H:%M:%S')
-                            else:
-                                check_in_dt = None
-
-                            # ถ้าเวลาสแกนก่อน check_in (ผิดปกติ) ให้ใช้ check_in + 1 วินาที
-                            if check_in_dt and adjusted_ts <= check_in_dt:
-                                fallback_dt = check_in_dt + timedelta(seconds=1)
-                                fallback_str = fallback_dt.strftime('%Y-%m-%d %H:%M:%S')
-                                try:
-                                    exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'write', args=[[oid], {'check_out': fallback_str}])
-                                    print(f"Sync: Employee {att.user_id} check_out adjusted to {fallback_str} for attendance {oid}")
-                                    continue
-                                except Exception:
-                                    logging.exception('Failed fallback write for attendance %s', oid)
-
-                            # ปกติพยายามเขียน check_out เป็นเวลา scan ที่ปรับแล้ว
-                            try:
-                                exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'write', args=[[oid], {'check_out': check_time}])
-                                print(f"Sync: Employee {att.user_id} check_out set to {check_time} for attendance {oid}")
-                            except xmlrpc.client.Fault as f:
-                                # วิเคราะห์ Fault: ถ้าเป็นปัญหา duplicate/constraint ให้ลอง fallback
-                                logging.warning('Fault when writing check_out for %s: %s', oid, f)
-                                if check_in_str:
-                                    try:
-                                        check_in_dt = datetime.strptime(check_in_str, '%Y-%m-%d %H:%M:%S')
-                                        fallback_dt = check_in_dt + timedelta(seconds=1)
-                                        fallback_str = fallback_dt.strftime('%Y-%m-%d %H:%M:%S')
-                                        exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'write', args=[[oid], {'check_out': fallback_str}])
-                                        print(f"Sync: Employee {att.user_id} check_out fallback to {fallback_str} for attendance {oid}")
-                                    except Exception:
-                                        logging.exception('Fallback also failed for attendance %s', oid)
-                                else:
-                                    logging.exception('No check_in found to compute fallback for attendance %s', oid)
+                            exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'write', 
+                                args=[[oid], {'check_out': check_time}])
+                            print(f"Sync: Employee {att.user_id} check_out set to {check_time} for attendance {oid}")
                         except Exception as e:
-                            logging.exception('Unexpected error while setting check_out for %s: %s', oid, e)
+                            logging.exception('Failed to set check_out for attendance %s: %s', oid, e)
+                            print(f"Warning: failed to set check_out for attendance {oid}: {e}")
                 else:
                     # ตรวจสอบว่ามีข้อมูลนี้ใน Odoo หรือยัง (ป้องกันการส่งซ้ำ)
-                    existing = exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'search', args=[[['employee_id', '=', emp_id], ['check_in', '=', check_time]]])
-
+                    existing = exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'search', 
+                        args=[[['employee_id', '=', emp_id], ['check_in', '=', check_time]]])
+                    
                     if not existing:
                         try:
-                            exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'create', args=[{
-                                'employee_id': emp_id,
-                                'check_in': check_time,
-                            }], retries=3)
+                            exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'create', 
+                                args=[{
+                                    'employee_id': emp_id,
+                                    'check_in': check_time,
+                                }], retries=3)
                             print(f"Sync: Employee {att.user_id} at {check_time} -> Odoo Success")
                         except Exception as e:
                             logging.exception('Failed to create attendance for %s at %s: %s', att.user_id, check_time, e)
                             print(f"Warning: failed to create check_in for {att.user_id}: {e}")
-            else:
-                print(f"Warning: Employee ID {att.user_id} not found in Odoo")
+        
+        # ประมวลผลข้อมูลที่จัดกลุ่มแล้ว
+        print(f"\nProcessing {len(attendance_by_employee_date)} employee-date records...")
+        
+        for (emp_id, date_str), data in attendance_by_employee_date.items():
+            checkins = sorted(data['checkins'])
+            checkouts = sorted(data['checkouts'])
+            
+            # ดึงข้อมูลพนักงาน
+            emp_data = exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.employee', 'read',
+                args=[[emp_id], ['name']])
+            emp_name = emp_data[0].get('name', f'ID {emp_id}') if emp_data else f'ID {emp_id}'
+            
+            print(f"\nProcessing: {emp_name} on {date_str}")
+            print(f"  Check-ins: {len(checkins)}, Check-outs: {len(checkouts)}")
+            
+            # กรณีที่ 1: มีทั้ง Check-In และ Check-Out
+            if checkins and checkouts:
+                # เลือกเวลาแรกที่เข้างาน และเวลาสุดท้ายที่ออกงาน
+                first_checkin = checkins[0]
+                last_checkout = checkouts[-1]
+                
+                # ตรวจสอบว่ามี attendance ในวันนี้หรือไม่
+                existing_att = exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'search',
+                    args=[[
+                        ['employee_id', '=', emp_id],
+                        ['check_in', '>=', f'{date_str} 00:00:00'],
+                        ['check_in', '<=', f'{date_str} 23:59:59']
+                    ]])
+                
+                if existing_att:
+                    # อัปเดต attendance ที่มีอยู่
+                    for att_id in existing_att:
+                        try:
+                            exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'write',
+                                args=[[att_id], {'check_in': first_checkin, 'check_out': last_checkout}])
+                            print(f"  ✅ Updated: Check-in {first_checkin}, Check-out {last_checkout}")
+                        except Exception as e:
+                            logging.exception('Failed to update attendance %s: %s', att_id, e)
+                            print(f"  ❌ Failed to update attendance {att_id}: {e}")
+                else:
+                    # สร้าง attendance ใหม่
+                    try:
+                        exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'create',
+                            args=[{
+                                'employee_id': emp_id,
+                                'check_in': first_checkin,
+                                'check_out': last_checkout,
+                            }], retries=3)
+                        print(f"  ✅ Created: Check-in {first_checkin}, Check-out {last_checkout}")
+                    except Exception as e:
+                        logging.exception('Failed to create attendance for %s on %s: %s', emp_id, date_str, e)
+                        print(f"  ❌ Failed to create attendance: {e}")
+            
+            # กรณีที่ 2: มี Check-In แต่ไม่มี Check-Out → ทำ Auto Check-Out
+            elif checkins and not checkouts:
+                first_checkin = checkins[0]
+                
+                # ตรวจสอบว่ามี attendance ที่เปิดอยู่หรือไม่
+                open_att_ids = exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'search',
+                    args=[[
+                        ['employee_id', '=', emp_id],
+                        ['check_in', '>=', f'{date_str} 00:00:00'],
+                        ['check_in', '<=', f'{date_str} 23:59:59'],
+                        ['check_out', '=', False]
+                    ]])
+                
+                if open_att_ids:
+                    # ทำ Auto Check-Out ที่เวลา 23:59 (FIXED: Convert to UTC)
+                    auto_checkout_dt = datetime.combine(
+                        datetime.strptime(date_str, '%Y-%m-%d').date(),
+                        dt_time(AUTO_CHECKOUT_HOUR, AUTO_CHECKOUT_MINUTE, 0)
+                    )
+                    auto_checkout_utc = auto_checkout_dt - timedelta(hours=7)  # FIX: Convert to UTC
+                    auto_checkout_str = auto_checkout_utc.strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    for att_id in open_att_ids:
+                        try:
+                            exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'write',
+                                args=[[att_id], {'check_out': auto_checkout_str}])
+                            print(f"  ✅ Auto Check-Out: Check-in {first_checkin}, Check-out {auto_checkout_str}")
+                        except Exception as e:
+                            logging.exception('Failed to auto check-out for attendance %s: %s', att_id, e)
+                            print(f"  ❌ Failed to auto check-out: {e}")
+                else:
+                    # สร้าง attendance ใหม่และทำ Auto Check-Out (FIXED: Convert to UTC)
+                    auto_checkout_dt = datetime.combine(
+                        datetime.strptime(date_str, '%Y-%m-%d').date(),
+                        dt_time(AUTO_CHECKOUT_HOUR, AUTO_CHECKOUT_MINUTE, 0)
+                    )
+                    auto_checkout_utc = auto_checkout_dt - timedelta(hours=7)  # FIX: Convert to UTC
+                    auto_checkout_str = auto_checkout_utc.strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    try:
+                        exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'create',
+                            args=[{
+                                'employee_id': emp_id,
+                                'check_in': first_checkin,
+                                'check_out': auto_checkout_str,
+                            }], retries=3)
+                        print(f"  ✅ Created with Auto Check-Out: Check-in {first_checkin}, Check-out {auto_checkout_str}")
+                    except Exception as e:
+                        logging.exception('Failed to create attendance for %s on %s: %s', emp_id, date_str, e)
+                        print(f"  ❌ Failed to create attendance: {e}")
+            
+            # กรณีที่ 3: มี Check-Out แต่ไม่มี Check-In → ทำ Auto Check-In
+            elif not checkins and checkouts:
+                last_checkout = checkouts[-1]
+                
+                # ทำ Auto Check-In ที่เวลา 10:00 (FIXED: Convert to UTC)
+                auto_checkin_dt = datetime.combine(
+                    datetime.strptime(date_str, '%Y-%m-%d').date(),
+                    dt_time(AUTO_CHECKIN_HOUR, AUTO_CHECKIN_MINUTE, 0)
+                )
+                auto_checkin_utc = auto_checkin_dt - timedelta(hours=7)  # FIX: Convert to UTC
+                auto_checkin_str = auto_checkin_utc.strftime('%Y-%m-%d %H:%M:%S')
+                
+                # ตรวจสอบว่ามี attendance ในวันนี้หรือไม่
+                existing_att = exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'search',
+                    args=[[
+                        ['employee_id', '=', emp_id],
+                        ['check_in', '>=', f'{date_str} 00:00:00'],
+                        ['check_in', '<=', f'{date_str} 23:59:59']
+                    ]])
+                
+                if existing_att:
+                    # อัปเดต attendance ที่มีอยู่
+                    for att_id in existing_att:
+                        try:
+                            exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'write',
+                                args=[[att_id], {'check_in': auto_checkin_str, 'check_out': last_checkout}])
+                            print(f"  ✅ Updated with Auto Check-In: Check-in {auto_checkin_str}, Check-out {last_checkout}")
+                        except Exception as e:
+                            logging.exception('Failed to update attendance %s: %s', att_id, e)
+                            print(f"  ❌ Failed to update attendance {att_id}: {e}")
+                else:
+                    # สร้าง attendance ใหม่
+                    try:
+                        exec_with_retry(models, ODOO_DB, uid, ODOO_PASS, 'hr.attendance', 'create',
+                            args=[{
+                                'employee_id': emp_id,
+                                'check_in': auto_checkin_str,
+                                'check_out': last_checkout,
+                            }], retries=3)
+                        print(f"  ✅ Created with Auto Check-In: Check-in {auto_checkin_str}, Check-out {last_checkout}")
+                    except Exception as e:
+                        logging.exception('Failed to create attendance for %s on %s: %s', emp_id, date_str, e)
+                        print(f"  ❌ Failed to create attendance: {e}")
 
     except Exception as e:
         # แปลง error เป็น string และ encode เป็น UTF-8 เพื่อแสดงภาษาไทยได้
@@ -212,12 +372,13 @@ def auto_checkout_pending_attendance(date_to_process=None):
             try:
                 check_in_dt = datetime.strptime(att['check_in'], '%Y-%m-%d %H:%M:%S')
                 
-                # ตั้ง check_out เป็นเวลาที่กำหนด (23:59) ของวันนั้น
+                # ตั้ง check_out เป็นเวลาที่กำหนด (23:59) ของวันนั้น (FIXED: Convert to UTC)
                 auto_checkout_dt = datetime.combine(
                     check_in_dt.date(), 
                     dt_time(AUTO_CHECKOUT_HOUR, AUTO_CHECKOUT_MINUTE, 0)
                 )
-                auto_checkout_str = auto_checkout_dt.strftime('%Y-%m-%d %H:%M:%S')
+                auto_checkout_utc = auto_checkout_dt - timedelta(hours=7)  # FIX: Convert to UTC
+                auto_checkout_str = auto_checkout_utc.strftime('%Y-%m-%d %H:%M:%S')
                 
                 # อัปเดต check_out
                 exec_with_retry(
@@ -250,11 +411,14 @@ def auto_checkout_pending_attendance(date_to_process=None):
         print(f"Error: {e}")
 
 
-# --- ฟังก์ชัน Auto Check-In ---
+# --- ฟังก์ชัน Auto Check-In (Backup) ---
 def auto_checkin_employees(date_to_process=None):
     """
     สร้าง check-in อัตโนมัติเวลา 10:00 น. สำหรับพนักงานที่ลืมสแกนเข้า
     แต่มีการ check-out ในวันนั้น (จากข้อมูลเครื่องสแกน)
+    
+    หมายเหตุ: ฟีเจอร์นี้เป็น backup เมื่อ sync_attendance() ไม่ได้ทำงาน
+    หรือมีข้อมูลที่ sync_attendance() ไม่ได้จัดการ
     
     Args:
         date_to_process: วันที่ต้องการประมวลผล (datetime.date object)
@@ -265,7 +429,7 @@ def auto_checkin_employees(date_to_process=None):
         print("Error: Cannot connect to Odoo")
         return
     
-    print(f"Connected to Odoo for Auto Check-In (UID: {uid})...")
+    print(f"Connected to Odoo for Auto Check-In (Backup) (UID: {uid})...")
     
     # กำหนดวันที่ต้องการประมวลผล
     if date_to_process is None:
@@ -275,91 +439,196 @@ def auto_checkin_employees(date_to_process=None):
     print(f"Processing auto check-in for date: {date_str}")
     
     try:
-        # ดึงรายชื่อพนักงานทั้งหมดที่ active
-        all_employee_ids = exec_with_retry(
-            models, ODOO_DB, uid, ODOO_PASS,
-            'hr.employee', 'search',
-            args=[[['active', '=', True]]]
-        )
+        # เชื่อมต่อเครื่องสแกนเพื่อดึงข้อมูล check-out
+        zk = ZK(ZK_IP, port=ZK_PORT, timeout=5)
+        conn = None
+        checkouts_by_employee = {}
         
-        if not all_employee_ids:
-            print("No active employees found")
-            return
+        try:
+            conn = zk.connect()
+            print("Connected to ZKTeco...")
+            attendances = conn.get_attendance()
+            
+            # จัดกลุ่ม check-outs ตามพนักงานและวันที่
+            for att in attendances:
+                # ปรับเวลาโดยลบ 7 ชั่วโมง (timezone / offset correction)
+                adjusted_ts = att.timestamp - timedelta(hours=7)
+                att_date_str = adjusted_ts.strftime('%Y-%m-%d')
+                
+                # ตรวจสอบว่าเป็นวันที่เดียวกับที่กำลังประมวลผลหรือไม่
+                if att_date_str != date_str:
+                    continue
+                
+                # อ่าน status จากเครื่องสแกน
+                scan_status = getattr(att, 'status', None)
+                
+                # ค้นหา ID ของพนักงานใน Odoo
+                employee_ids = models.execute_kw(ODOO_DB, uid, ODOO_PASS, 'hr.employee', 'search', 
+                    [[['barcode', '=', str(att.user_id)]]])
+                
+                if not employee_ids:
+                    continue
+                
+                emp_id = employee_ids[0]
+                
+                # ถ้าเป็น Check-Out ให้จัดเก็บ
+                if scan_status == 1:
+                    if emp_id not in checkouts_by_employee:
+                        checkouts_by_employee[emp_id] = []
+                    checkouts_by_employee[emp_id].append(adjusted_ts.strftime('%Y-%m-%d %H:%M:%S'))
+            
+            print(f"Found {len(checkouts_by_employee)} employees with check-outs on {date_str}")
+            
+        except Exception as e:
+            logging.exception(f"Error connecting to ZKTeco: {e}")
+            print(f"Warning: Could not connect to ZKTeco, processing all active employees instead")
+        finally:
+            if conn:
+                conn.disconnect()
+                print("Disconnected from ZKTeco")
         
-        print(f"Found {len(all_employee_ids)} active employee(s)")
-        
-        # ตรวจสอบแต่ละพนักงาน
+        # ตรวจสอบแต่ละพนักงานที่มี check-out แต่ไม่มี check-in
         success_count = 0
         skipped_count = 0
         error_count = 0
         
-        for emp_id in all_employee_ids:
-            try:
-                # ตรวจสอบว่าพนักงานมี attendance ในวันนี้หรือไม่
-                existing_att = exec_with_retry(
-                    models, ODOO_DB, uid, ODOO_PASS,
-                    'hr.attendance', 'search',
-                    args=[[
-                        ['employee_id', '=', emp_id],
-                        ['check_in', '>=', f'{date_str} 00:00:00'],
-                        ['check_in', '<=', f'{date_str} 23:59:59']
-                    ]]
-                )
-                
-                if existing_att:
-                    # มี attendance อยู่แล้ว ข้ามไป
-                    skipped_count += 1
-                    continue
-                
-                # ดึงข้อมูลพนักงาน
-                emp_data = exec_with_retry(
-                    models, ODOO_DB, uid, ODOO_PASS,
-                    'hr.employee', 'read',
-                    args=[[emp_id], ['name', 'barcode']]
-                )
-                
-                if not emp_data:
-                    continue
-                
-                emp_name = emp_data[0].get('name', 'Unknown')
-                emp_barcode = emp_data[0].get('barcode', '')
-                
-                # ตรวจสอบว่าพนักงานมี barcode หรือไม่ (ต้องมี barcode จึงจะ sync ได้)
-                if not emp_barcode:
-                    skipped_count += 1
-                    continue
-                
-                # สร้าง check-in เวลา 10:00 น.
-                auto_checkin_dt = datetime.combine(
-                    date_to_process,
-                    dt_time(AUTO_CHECKIN_HOUR, AUTO_CHECKIN_MINUTE, 0)
-                )
-                # ปรับเวลาเป็น UTC (ลบ 7 ชั่วโมงสำหรับเวลาไทย)
-                auto_checkin_utc = auto_checkin_dt - timedelta(hours=7)
-                auto_checkin_str = auto_checkin_utc.strftime('%Y-%m-%d %H:%M:%S')
-                
-                # สร้าง attendance record
-                exec_with_retry(
-                    models, ODOO_DB, uid, ODOO_PASS,
-                    'hr.attendance', 'create',
-                    args=[{
-                        'employee_id': emp_id,
-                        'check_in': auto_checkin_str
-                    }]
-                )
-                
-                print(f"✅ Auto check-in: {emp_name} | Check-in: {auto_checkin_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                success_count += 1
-                
-            except Exception as e:
-                logging.exception(f"Failed to auto check-in for employee {emp_id}: {e}")
-                print(f"❌ Failed: Employee ID {emp_id}")
-                error_count += 1
+        # ถ้าไม่สามารถเชื่อมต่อ ZKTeco ได้ ให้ประมวลผลทุกพนักงานเหมือนเดิม
+        if not checkouts_by_employee:
+            # ดึงรายชื่อพนักงานทั้งหมดที่ active
+            all_employee_ids = exec_with_retry(
+                models, ODOO_DB, uid, ODOO_PASS,
+                'hr.employee', 'search',
+                args=[[['active', '=', True]]]
+            )
+            
+            if not all_employee_ids:
+                print("No active employees found")
+                return
+            
+            print(f"Processing {len(all_employee_ids)} active employees (fallback mode)")
+            
+            for emp_id in all_employee_ids:
+                try:
+                    # ตรวจสอบว่าพนักงานมี attendance ในวันนี้หรือไม่
+                    existing_att = exec_with_retry(
+                        models, ODOO_DB, uid, ODOO_PASS,
+                        'hr.attendance', 'search',
+                        args=[[
+                            ['employee_id', '=', emp_id],
+                            ['check_in', '>=', f'{date_str} 00:00:00'],
+                            ['check_in', '<=', f'{date_str} 23:59:59']
+                        ]]
+                    )
+                    
+                    if existing_att:
+                        skipped_count += 1
+                        continue
+                    
+                    # ดึงข้อมูลพนักงาน
+                    emp_data = exec_with_retry(
+                        models, ODOO_DB, uid, ODOO_PASS,
+                        'hr.employee', 'read',
+                        args=[[emp_id], ['name', 'barcode']]
+                    )
+                    
+                    if not emp_data:
+                        continue
+                    
+                    emp_name = emp_data[0].get('name', 'Unknown')
+                    emp_barcode = emp_data[0].get('barcode', '')
+                    
+                    if not emp_barcode:
+                        skipped_count += 1
+                        continue
+                    
+                    # สร้าง check-in เวลา 10:00 น.
+                    auto_checkin_dt = datetime.combine(
+                        date_to_process,
+                        dt_time(AUTO_CHECKIN_HOUR, AUTO_CHECKIN_MINUTE, 0)
+                    )
+                    auto_checkin_utc = auto_checkin_dt - timedelta(hours=7)
+                    auto_checkin_str = auto_checkin_utc.strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    exec_with_retry(
+                        models, ODOO_DB, uid, ODOO_PASS,
+                        'hr.attendance', 'create',
+                        args=[{
+                            'employee_id': emp_id,
+                            'check_in': auto_checkin_str
+                        }]
+                    )
+                    
+                    print(f"✅ Auto check-in: {emp_name} | Check-in: {auto_checkin_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                    success_count += 1
+                    
+                except Exception as e:
+                    logging.exception(f"Failed to auto check-in for employee {emp_id}: {e}")
+                    print(f"❌ Failed: Employee ID {emp_id}")
+                    error_count += 1
+        else:
+            # ประมวลผลเฉพาะพนักงานที่มี check-out แต่ไม่มี check-in
+            for emp_id, checkout_times in checkouts_by_employee.items():
+                try:
+                    # ตรวจสอบว่าพนักงานมี attendance ในวันนี้หรือไม่
+                    existing_att = exec_with_retry(
+                        models, ODOO_DB, uid, ODOO_PASS,
+                        'hr.attendance', 'search',
+                        args=[[
+                            ['employee_id', '=', emp_id],
+                            ['check_in', '>=', f'{date_str} 00:00:00'],
+                            ['check_in', '<=', f'{date_str} 23:59:59']
+                        ]]
+                    )
+                    
+                    if existing_att:
+                        skipped_count += 1
+                        continue
+                    
+                    # ดึงข้อมูลพนักงาน
+                    emp_data = exec_with_retry(
+                        models, ODOO_DB, uid, ODOO_PASS,
+                        'hr.employee', 'read',
+                        args=[[emp_id], ['name']]
+                    )
+                    
+                    if not emp_data:
+                        continue
+                    
+                    emp_name = emp_data[0].get('name', f'ID {emp_id}')
+                    
+                    # ใช้เวลา check-out สุดท้าย
+                    last_checkout = sorted(checkout_times)[-1]
+                    
+                    # สร้าง check-in เวลา 10:00 น.
+                    auto_checkin_dt = datetime.combine(
+                        date_to_process,
+                        dt_time(AUTO_CHECKIN_HOUR, AUTO_CHECKIN_MINUTE, 0)
+                    )
+                    auto_checkin_utc = auto_checkin_dt - timedelta(hours=7)
+                    auto_checkin_str = auto_checkin_utc.strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    exec_with_retry(
+                        models, ODOO_DB, uid, ODOO_PASS,
+                        'hr.attendance', 'create',
+                        args=[{
+                            'employee_id': emp_id,
+                            'check_in': auto_checkin_str,
+                            'check_out': last_checkout
+                        }]
+                    )
+                    
+                    print(f"✅ Auto check-in: {emp_name} | Check-in: {auto_checkin_dt.strftime('%Y-%m-%d %H:%M:%S')}, Check-out: {last_checkout}")
+                    success_count += 1
+                    
+                except Exception as e:
+                    logging.exception(f"Failed to auto check-in for employee {emp_id}: {e}")
+                    print(f"❌ Failed: Employee ID {emp_id}")
+                    error_count += 1
         
         # สรุปผลการทำงาน
         print("=" * 60)
         print(f"AUTO CHECK-IN SUMMARY for {date_str}")
-        print(f"Total employees: {len(all_employee_ids)}")
+        print(f"Total processed: {len(checkouts_by_employee) if checkouts_by_employee else len(all_employee_ids)}")
         print(f"Created check-in: {success_count}")
         print(f"Skipped (already checked in): {skipped_count}")
         print(f"Failed: {error_count}")
